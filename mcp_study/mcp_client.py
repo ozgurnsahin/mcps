@@ -1,5 +1,5 @@
 from contextlib import AsyncExitStack
-from typing import Optional
+from typing import Dict, List
 from dotenv import load_dotenv
 
 from openai import OpenAI
@@ -9,27 +9,45 @@ from mcp.client.stdio import stdio_client
 class MCPClient:
     def __init__(self):
         load_dotenv()
-        self.session: Optional[ClientSession] = None
+        self.sessions: Dict[str, ClientSession] = {}
         self.exit_stack = AsyncExitStack()
         self.client = OpenAI()
 
-    async def connect_to_server(self):
-        server_params = StdioServerParameters(
+    async def connect_to_servers(self):
+        time_server_params = StdioServerParameters(
             command="uvx",
-            args = ["mcp-server-time"],
+            args=["mcp-server-time"],
             env=None
         )
         
-        stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
-        self.stdio, self.write = stdio_transport
-        self.session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
+        stdio_transport_time = await self.exit_stack.enter_async_context(stdio_client(time_server_params))
+        stdio_time, write_time = stdio_transport_time
+        session_time = await self.exit_stack.enter_async_context(ClientSession(stdio_time, write_time))
+        await session_time.initialize()
+        self.sessions["time"] = session_time
         
-        await self.session.initialize()
+        browser_server_params = StdioServerParameters(
+            command="python",
+            args=["mcp_server.py"],
+            env=None
+        )
         
-        # Get tools list
-        response = await self.session.list_tools()
-        tools = response.tools
-        print("\nConnected to server with tools:", [tool.name for tool in tools])
+        stdio_transport_browser = await self.exit_stack.enter_async_context(stdio_client(browser_server_params))
+        stdio_browser, write_browser = stdio_transport_browser
+        session_browser = await self.exit_stack.enter_async_context(ClientSession(stdio_browser, write_browser))
+        await session_browser.initialize()
+        self.sessions["browser"] = session_browser
+        
+        await self.list_all_tools()
+    
+    async def list_all_tools(self):
+        all_tools = []
+        for server_name, session in self.sessions.items():
+            response = await session.list_tools()
+            tools = response.tools
+            print(f"\n{server_name.title()} server tools:", [tool.name for tool in tools])
+            all_tools.extend(tools)
+        return all_tools
         
     async def process_query(self, query: str):
         messages = [
@@ -39,7 +57,7 @@ class MCPClient:
             }
         ]
         
-        response = await self.session.list_tools()
+        all_tools = await self.list_all_tools()
         tool_list = [{
             "type": "function",
             "function": {
@@ -47,7 +65,7 @@ class MCPClient:
                 "description": tool.description,
                 "parameters": tool.inputSchema
             }
-        } for tool in response.tools]
+        } for tool in all_tools]
         
         response = self.client.chat.completions.create(
             model = "gpt-4o-mini",
@@ -68,15 +86,29 @@ class MCPClient:
             for tool_call in message.tool_calls:
                 tool_name = tool_call.function.name
                 tool_args = eval(tool_call.function.arguments)
+
+                target_session = None
+                for session in self.sessions.values():
+                    response = await session.list_tools()
+                    if any(tool.name == tool_name for tool in response.tools):
+                        target_session = session
+                        break
                 
-                result = await self.session.call_tool(tool_name, tool_args)
-                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
-                
-                tool_messages.append({
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "content": str(result.content)
-                })
+                if target_session:
+                    result = await target_session.call_tool(tool_name, tool_args)
+                    final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+                    
+                    tool_messages.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "content": str(result.content)
+                    })
+                else:
+                    tool_messages.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "content": f"Error: Tool {tool_name} not found in any server"
+                    })
             
             messages.append({
                 "role": "assistant",
